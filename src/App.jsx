@@ -145,7 +145,7 @@ function parseStoredPoints(rawValue) {
       date: String(point.date || ""),
       photo: point.photo || null,
     }));
-    return validPoints.length > 0 ? validPoints : null;
+    return validPoints;
   } catch {
     return null;
   }
@@ -153,7 +153,9 @@ function parseStoredPoints(rawValue) {
 
 function loadStoredPoints() {
   if (typeof window === "undefined" || !window.localStorage) return initialPoints;
-  const stored = parseStoredPoints(window.localStorage.getItem(STORAGE_KEY));
+  const rawValue = window.localStorage.getItem(STORAGE_KEY);
+  if (rawValue === null) return initialPoints;
+  const stored = parseStoredPoints(rawValue);
   return stored || initialPoints;
 }
 
@@ -231,6 +233,9 @@ function runBasicTests() {
   const serialized = serializePoints([point, { lat: NaN, lng: 138 }]);
   const parsed = parseStoredPoints(serialized);
   console.assert(Array.isArray(parsed) && parsed.length === 1, "Stored points should round-trip and skip invalid points");
+
+  const emptyStoredPoints = parseStoredPoints("[]");
+  console.assert(Array.isArray(emptyStoredPoints) && emptyStoredPoints.length === 0, "Empty stored points should stay empty after reload");
 
   const brokenStorage = parseStoredPoints("not-json");
   console.assert(brokenStorage === null, "Broken storage JSON should safely return null");
