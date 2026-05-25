@@ -1,6 +1,15 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 const STORAGE_KEY = "takenoko-location-map-points-v1";
+const DB_NAME = "takenoko-location-map";
+const DB_VERSION = 1;
+const DB_STORE_NAME = "snapshots";
+const DB_POINTS_KEY = "points";
+const MAX_PHOTO_EDGE = 1280;
+const MIN_PHOTO_EDGE = 720;
+const PHOTO_JPEG_QUALITY = 0.72;
+const MIN_PHOTO_JPEG_QUALITY = 0.5;
+const TARGET_PHOTO_DATA_URL_LENGTH = 450000;
 
 const TAG_OPTIONS = [
   "太い",
@@ -53,6 +62,54 @@ const initialPoints = [
 function formatNow(date = new Date()) {
   const pad = (n) => String(n).padStart(2, "0");
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("Could not read photo"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function loadImage(dataUrl) {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("Could not load photo"));
+    image.src = dataUrl;
+  });
+}
+
+async function compressPhotoFile(file) {
+  const dataUrl = await readFileAsDataUrl(file);
+  if (!file.type.startsWith("image/")) return dataUrl;
+
+  const image = await loadImage(dataUrl);
+  const sourceWidth = image.naturalWidth || image.width;
+  const sourceHeight = image.naturalHeight || image.height;
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  if (!context) return dataUrl;
+
+  let maxEdge = MAX_PHOTO_EDGE;
+  let quality = PHOTO_JPEG_QUALITY;
+  let compressed = dataUrl;
+
+  do {
+    const scale = Math.min(1, maxEdge / Math.max(sourceWidth, sourceHeight));
+    const width = Math.max(1, Math.round(sourceWidth * scale));
+    const height = Math.max(1, Math.round(sourceHeight * scale));
+    canvas.width = width;
+    canvas.height = height;
+    context.drawImage(image, 0, 0, width, height);
+    compressed = canvas.toDataURL("image/jpeg", quality);
+    maxEdge = Math.max(MIN_PHOTO_EDGE, Math.round(maxEdge * 0.82));
+    quality = Math.max(MIN_PHOTO_JPEG_QUALITY, quality - 0.06);
+  } while (compressed.length > TARGET_PHOTO_DATA_URL_LENGTH && (maxEdge > MIN_PHOTO_EDGE || quality > MIN_PHOTO_JPEG_QUALITY));
+
+  return compressed.length < dataUrl.length ? compressed : dataUrl;
 }
 
 function getValidPoints(points) {
@@ -169,6 +226,85 @@ function savePointsToStorage(points) {
   }
 }
 
+function openPointsDatabase() {
+  return new Promise((resolve, reject) => {
+    if (typeof window === "undefined" || !window.indexedDB) {
+      reject(new Error("IndexedDB is not available"));
+      return;
+    }
+
+    const request = window.indexedDB.open(DB_NAME, DB_VERSION);
+    request.onupgradeneeded = () => {
+      const database = request.result;
+      if (!database.objectStoreNames.contains(DB_STORE_NAME)) {
+        database.createObjectStore(DB_STORE_NAME);
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("Could not open IndexedDB"));
+  });
+}
+
+function withPointsStore(mode, callback) {
+  return openPointsDatabase().then(
+    (database) =>
+      new Promise((resolve, reject) => {
+        const transaction = database.transaction(DB_STORE_NAME, mode);
+        const store = transaction.objectStore(DB_STORE_NAME);
+        const request = callback(store);
+        let result;
+
+        request.onsuccess = () => {
+          result = request.result;
+        };
+        request.onerror = () => reject(request.error || new Error("IndexedDB request failed"));
+        transaction.oncomplete = () => {
+          database.close();
+          resolve(result);
+        };
+        transaction.onerror = () => {
+          database.close();
+          reject(transaction.error || new Error("IndexedDB transaction failed"));
+        };
+      })
+  );
+}
+
+async function loadPointsFromIndexedDb() {
+  try {
+    const rawValue = await withPointsStore("readonly", (store) => store.get(DB_POINTS_KEY));
+    if (rawValue === undefined) return null;
+    return parseStoredPoints(rawValue);
+  } catch {
+    return null;
+  }
+}
+
+async function savePointsToIndexedDb(points) {
+  try {
+    await withPointsStore("readwrite", (store) => store.put(serializePoints(points), DB_POINTS_KEY));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function loadPersistedPoints() {
+  const indexedPoints = await loadPointsFromIndexedDb();
+  if (indexedPoints !== null) return indexedPoints;
+  return loadStoredPoints();
+}
+
+async function savePointsToPersistentStorage(points) {
+  const indexedSaved = await savePointsToIndexedDb(points);
+  if (indexedSaved) {
+    savePointsToStorage(points);
+    return true;
+  }
+
+  return savePointsToStorage(points);
+}
+
 function getInitialSelectedId() {
   const loaded = loadStoredPoints();
   return loaded[0]?.id ?? initialPoints[0]?.id ?? null;
@@ -276,12 +412,13 @@ function SectionCard({ children, className = "" }) {
   return <div className={`rounded-3xl border border-stone-200 bg-white shadow-sm ${className}`}>{children}</div>;
 }
 
-function AppButton({ children, onClick, className = "", type = "button" }) {
+function AppButton({ children, onClick, className = "", type = "button", disabled = false }) {
   return (
     <button
       type={type}
       onClick={onClick}
-      className={`inline-flex min-h-11 items-center justify-center rounded-2xl px-4 py-3 text-sm font-bold transition active:scale-[0.99] ${className}`}
+      disabled={disabled}
+      className={`inline-flex min-h-11 items-center justify-center rounded-2xl px-4 py-3 text-sm font-bold transition active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-60 ${className}`}
     >
       {children}
     </button>
@@ -474,6 +611,8 @@ function PointForm({
   manualLng,
   setManualLng,
   photo,
+  photoStatus,
+  isPhotoProcessing,
   handlePhoto,
   getCurrentLocation,
   locationStatus,
@@ -587,7 +726,9 @@ function PointForm({
             </div>
           )}
 
-          <AppButton onClick={addPoint} className="w-full bg-lime-600 py-4 text-white hover:bg-lime-700">
+          {photoStatus && <p className="rounded-2xl bg-lime-50 px-3 py-2 text-xs font-bold text-lime-800">{photoStatus}</p>}
+
+          <AppButton onClick={addPoint} disabled={isPhotoProcessing} className="w-full bg-lime-600 py-4 text-white hover:bg-lime-700">
             <Icon type="pin" className="mr-2" />
             この地点を保存する
           </AppButton>
@@ -752,18 +893,61 @@ export default function TakenokoLocationMapApp() {
   const [customTag, setCustomTag] = useState("");
   const [memo, setMemo] = useState("");
   const [photo, setPhoto] = useState(null);
+  const [photoStatus, setPhotoStatus] = useState("");
+  const [isPhotoProcessing, setIsPhotoProcessing] = useState(false);
+  const [isStorageReady, setIsStorageReady] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
   const [manualLat, setManualLat] = useState("35.9150");
   const [manualLng, setManualLng] = useState("138.2390");
   const [selectedId, setSelectedId] = useState(() => getInitialSelectedId());
   const [locationStatus, setLocationStatus] = useState("現在地未取得");
-  const [storageStatus, setStorageStatus] = useState("localStorageに自動保存します");
+  const [storageStatus, setStorageStatus] = useState("IndexedDBに自動保存します");
   const [activeFilterTag, setActiveFilterTag] = useState("すべて");
   const [mobileTab, setMobileTab] = useState("record");
 
   useEffect(() => {
-    const saved = savePointsToStorage(points);
-    setStorageStatus(saved ? "保存済み：この端末のlocalStorage" : "保存失敗：写真が大きすぎる可能性があります");
-  }, [points]);
+    let isActive = true;
+
+    loadPersistedPoints().then((loadedPoints) => {
+      if (!isActive) return;
+      setPoints(loadedPoints);
+      setSelectedId(loadedPoints[0]?.id ?? null);
+      setIsStorageReady(true);
+      setStorageStatus("保存済み：この端末のIndexedDB");
+    });
+
+    return () => {
+      isActive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isStorageReady) return undefined;
+
+    let isActive = true;
+    setIsSaving(true);
+    savePointsToPersistentStorage(points).then((saved) => {
+      if (!isActive) return;
+      setStorageStatus(saved ? "保存済み：この端末のIndexedDB" : "保存失敗：写真が大きすぎる可能性があります");
+      setIsSaving(false);
+    });
+
+    return () => {
+      isActive = false;
+    };
+  }, [points, isStorageReady]);
+
+  useEffect(() => {
+    if (!isPhotoProcessing && !isSaving && !photo) return undefined;
+
+    const handleBeforeUnload = (event) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [isPhotoProcessing, isSaving, photo]);
 
   const allTags = useMemo(() => {
     const pointTags = points.flatMap((point) => point.tags || []);
@@ -777,13 +961,24 @@ export default function TakenokoLocationMapApp() {
 
   const selected = points.find((point) => point.id === selectedId) || points[0] || null;
 
-  const handlePhoto = (event) => {
+  const handlePhoto = async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
 
-    const reader = new FileReader();
-    reader.onload = () => setPhoto(String(reader.result || ""));
-    reader.readAsDataURL(file);
+    setIsPhotoProcessing(true);
+    setPhotoStatus("写真を保存用に縮小しています...");
+
+    try {
+      const nextPhoto = await compressPhotoFile(file);
+      setPhoto(nextPhoto);
+      setPhotoStatus("写真を保存用に縮小しました");
+    } catch {
+      setPhoto(null);
+      setPhotoStatus("写真の読み込みに失敗しました");
+    } finally {
+      setIsPhotoProcessing(false);
+      event.target.value = "";
+    }
   };
 
   const getCurrentLocation = () => {
@@ -816,7 +1011,16 @@ export default function TakenokoLocationMapApp() {
     setCustomTag("");
   };
 
-  const addPoint = () => {
+  const addPoint = async () => {
+    if (isPhotoProcessing) {
+      setLocationStatus("写真の処理が終わるまで待ってから保存してください。");
+      return;
+    }
+
+    if (isSaving) {
+      return;
+    }
+
     const lat = Number(manualLat);
     const lng = Number(manualLng);
 
@@ -831,13 +1035,23 @@ export default function TakenokoLocationMapApp() {
     }
 
     const newPoint = createTakenokoPoint({ title, tags: selectedTags, memo, lat, lng, photo });
+    const nextPoints = [newPoint, ...points];
+    setIsSaving(true);
+    const saved = await savePointsToPersistentStorage(nextPoints);
+    setIsSaving(false);
+    if (!saved) {
+      setLocationStatus("写真の容量が大きく、保存できませんでした。別の写真で試してください。");
+      setStorageStatus("保存失敗：写真が大きすぎる可能性があります");
+      return;
+    }
 
-    setPoints((prev) => [newPoint, ...prev]);
+    setPoints(nextPoints);
     setSelectedId(newPoint.id);
     setTitle("筍ポイント");
     setSelectedTags(["未採取"]);
     setMemo("");
     setPhoto(null);
+    setPhotoStatus("");
     setLocationStatus("地点を保存しました");
     setMobileTab("detail");
   };
@@ -889,6 +1103,8 @@ export default function TakenokoLocationMapApp() {
     manualLng,
     setManualLng,
     photo,
+    photoStatus,
+    isPhotoProcessing: isPhotoProcessing || isSaving,
     handlePhoto,
     getCurrentLocation,
     locationStatus,
@@ -976,7 +1192,7 @@ export default function TakenokoLocationMapApp() {
                 </div>
                 <p className="text-sm font-bold text-stone-800">{storageStatus}</p>
                 <p className="mt-1 text-xs leading-5 text-stone-500">
-                  まずは無料・登録不要のlocalStorage保存です。同じ端末・同じブラウザで再表示できます。将来、複数端末同期が必要ならFirebase無料枠やSupabase無料枠に差し替えます。
+                  まずは無料・登録不要のIndexedDB保存です。写真付きの記録も同じ端末・同じブラウザで再表示できます。将来、複数端末同期が必要ならFirebase無料枠やSupabase無料枠に差し替えます。
                 </p>
               </div>
               <div className="flex flex-wrap gap-2">
