@@ -559,13 +559,19 @@ function LeafletMapPanel({ points, selectedId, onSelectPoint, compact = false })
         )
         .join("");
 
-      marker.bindPopup(`
-        <div style="min-width:180px;">
+      const photoHtml = point.photo
+        ? `<img src="${point.photo}" style="width:100%;height:150px;object-fit:cover;border-radius:8px;margin-bottom:8px;display:block;">`
+        : "";
+
+      marker.bindPopup(
+        `<div style="min-width:220px;">
+          ${photoHtml}
           <div style="font-weight:800;margin-bottom:4px;">${index + 1}. ${point.title}</div>
           <div style="margin-bottom:6px;">${tagsHtml}</div>
           <div style="font-size:12px;color:#666;">${point.date}</div>
-        </div>
-      `);
+        </div>`,
+        { maxWidth: 300 }
+      );
       marker.on("click", () => onSelectPoint(point.id));
       marker.addTo(layer);
       bounds.push([point.lat, point.lng]);
